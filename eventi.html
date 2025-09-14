@@ -86,5 +86,221 @@
   - durante lo scroll invia al parent (window.parent.postMessage) i messaggi:
       { type: 'dateChange', date: '15 settembre 2025', index: 3 }
   - fallback compatibile se IntersectionObserver non disponibile
-  - se la pagi
+  - se la pagina NON è dentro un iframe, mostra una sticky interna per test
+*/
 
+(function () {
+  'use strict';
+
+  /* --- utilità --- */
+  function normalize(s){
+    if(!s) return s;
+    try { return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim(); }
+    catch(e) { return String(s).toLowerCase().trim(); }
+  }
+
+  // mappa mesi (it / en / fr) — normalizzate senza accenti
+  const monthMap = (function(){
+    const pairs = [
+      ['jan',0,['gennaio','january','janvier','jan']],
+      ['feb',1,['febbraio','february','fevrier','fev','feb']],
+      ['mar',2,['marzo','march','mars','mar']],
+      ['apr',3,['aprile','april','avril','apr']],
+      ['may',4,['maggio','may','mai']],
+      ['jun',5,['giugno','june','juin','giu','jun']],
+      ['jul',6,['luglio','july','juillet','lug']],
+      ['aug',7,['agosto','august','aout','aug','ago']],
+      ['sep',8,['settembre','september','septembre','sep','sett']],
+      ['oct',9,['ottobre','october','octobre','oct','ott']],
+      ['nov',10,['novembre','november','nov']],
+      ['dec',11,['dicembre','december','decembre','dec','dic']]
+    ];
+    const m = {};
+    pairs.forEach(p => p[2].forEach(name => m[normalize(name)] = p[1]));
+    return m;
+  })();
+
+  function parseDateFlexible(str){
+    if(!str) return null;
+    str = String(str).trim();
+    // ISO YYYY-MM-DD
+    let iso = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if(iso){
+      const y = parseInt(iso[1],10), m = parseInt(iso[2],10)-1, d = parseInt(iso[3],10);
+      const dd = new Date(y,m,d); dd.setHours(0,0,0,0); return dd;
+    }
+    // possibili formati "DD month YYYY" (month può essere "settembre", "septembre", "September", ecc.)
+    let m = str.match(/(\d{1,2})\s+([^\d]+?)\s+(\d{4})/);
+    if(m){
+      const day = parseInt(m[1],10);
+      const monthStr = normalize(m[2].replace(/\./g,''));
+      const year = parseInt(m[3],10);
+      if(monthMap.hasOwnProperty(monthStr)){
+        const monthNum = monthMap[monthStr];
+        const dd = new Date(year, monthNum, day);
+        dd.setHours(0,0,0,0);
+        return dd;
+      }
+    }
+    // ultimo tentativo: "YYYY/MM/DD" o "DD/MM/YYYY"
+    m = str.match(/^(\d{2,4})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+    if(m){
+      // determiniamo se è YYYY/MM/DD o DD/MM/YYYY
+      if(m[1].length === 4){
+        const y = parseInt(m[1],10), mo = parseInt(m[2],10)-1, d = parseInt(m[3],10);
+        const dd = new Date(y,mo,d); dd.setHours(0,0,0,0); return dd;
+      } else if(m[3].length === 4){
+        const d = parseInt(m[1],10), mo = parseInt(m[2],10)-1, y = parseInt(m[3],10);
+        const dd = new Date(y,mo,d); dd.setHours(0,0,0,0); return dd;
+      }
+    }
+    return null;
+  }
+
+  /* --- elementi --- */
+  const sections = Array.from(document.querySelectorAll('section.day'));
+  if(!sections.length){
+    console.warn('eventi.html: nessuna section.day trovata');
+    return;
+  }
+
+  // prepare array with parsed date and display text
+  const events = sections.map((el, idx) => {
+    // preferisco data-date-iso se presente
+    const iso = el.dataset.dateIso || el.getAttribute('data-date-iso') || el.dataset.dateIso;
+    const raw = el.dataset.date || el.getAttribute('data-date') || el.querySelector('h3')?.textContent || '';
+    const parsed = parseDateFlexible(iso || raw);
+    const display = raw.trim();
+    return { el, parsed, display, raw, idx };
+  });
+
+  // keep order as in DOM but sort only for debug if needed
+  // find first event with date >= today; otherwise target = first element
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  let targetEntry = events.find(ev => ev.parsed && ev.parsed >= today) || events[0];
+
+  // mark target visually
+  if(targetEntry && targetEntry.el){
+    targetEntry.el.classList.add('today');
+  }
+
+  /* --- functions to talk to parent (Cargo) --- */
+  function sendToParent(msg){
+    try {
+      if(window.parent && window.parent !== window){
+        window.parent.postMessage(msg, '*'); // parent should accept messages
+      } else {
+        // if no parent (opened directly), show local sticky
+        const ls = document.getElementById('local-sticky');
+        if(ls){
+          ls.style.display = 'block';
+          ls.setAttribute('aria-hidden','false');
+          if(msg.type === 'dateChange') ls.textContent = msg.date;
+        }
+      }
+    } catch(e){
+      // ignore
+    }
+  }
+
+  /* --- scroll to target reliably --- */
+  function scrollToElement(el){
+    if(!el) return;
+    // Try several times (rAF + small timeout) to ensure layout stable before scrolling
+    const attempts = 6;
+    let i = 0;
+    function doScroll(){
+      if(i++ > attempts) {
+        // last attempt: scrollIntoView
+        try { el.scrollIntoView({ behavior:'auto', block:'start' }); } catch(e){}
+        // fire one final update
+        updateCurrentVisible();
+        return;
+      }
+      // center the element approximately at 15% from top to emulate header offset
+      const rect = el.getBoundingClientRect();
+      const absoluteY = rect.top + window.pageYOffset;
+      const offset = Math.round(window.innerHeight * 0.12); // place slightly below top (12% of viewport)
+      const targetY = Math.max(0, absoluteY - offset);
+      window.scrollTo({ top: targetY, behavior: 'auto' });
+      requestAnimationFrame(() => setTimeout(doScroll, 20));
+    }
+    doScroll();
+  }
+
+  /* --- visible detection & notify parent --- */
+  let ticking = false;
+  function updateCurrentVisible(){
+    // we pick the last section whose top <= threshold (threshold = 12% of viewport)
+    const threshold = Math.round(window.innerHeight * 0.12);
+    let chosen = sections[0];
+    for(const s of sections){
+      const r = s.getBoundingClientRect();
+      if(r.top <= threshold) chosen = s;
+      else break;
+    }
+    // find corresponding event
+    const ev = events.find(e => e.el === chosen) || events[0];
+    const dateText = ev && ev.display ? ev.display : (chosen.dataset.date || chosen.dataset.dateIso || chosen.querySelector('h3')?.textContent || '—');
+    // send to parent
+    sendToParent({ type: 'dateChange', date: dateText, index: ev ? ev.idx : 0 });
+  }
+
+  // optimized scroll handler
+  function onScroll(){
+    if(!ticking){
+      ticking = true;
+      requestAnimationFrame(()=>{ updateCurrentVisible(); ticking = false; });
+    }
+  }
+
+  // IntersectionObserver optional fast path
+  let io;
+  if('IntersectionObserver' in window){
+    try {
+      io = new IntersectionObserver((entries) => {
+        // choose the entry with largest intersection ratio
+        let best = null;
+        for(const en of entries){
+          if(!best || en.intersectionRatio > best.intersectionRatio) best = en;
+        }
+        if(best && best.isIntersecting){
+          const el = best.target;
+          const ev = events.find(e => e.el === el);
+          if(ev) sendToParent({ type:'dateChange', date: ev.display || ev.raw, index: ev.idx });
+        } else {
+          // fallback to compute from scroll
+          updateCurrentVisible();
+        }
+      }, { root: null, rootMargin: '0px 0px -60% 0px', threshold: [0, 0.1, 0.25, 0.5] });
+      sections.forEach(s => io.observe(s));
+    } catch(e){
+      // if IO fails, we'll use scroll fallback
+      window.addEventListener('scroll', onScroll, { passive: true });
+    }
+  } else {
+    window.addEventListener('scroll', onScroll, { passive: true });
+  }
+
+  // also update on resize / orientation change
+  window.addEventListener('resize', () => { updateCurrentVisible(); }, { passive: true });
+  window.addEventListener('orientationchange', () => { updateCurrentVisible(); }, { passive: true });
+
+  // initial actions: scroll to target and notify parent of ready state
+  sendToParent({ type: 'eventsReady', count: events.length });
+  if(targetEntry && targetEntry.el){
+    // scroll after a short delay to allow parent adjustments
+    setTimeout(() => {
+      scrollToElement(targetEntry.el);
+      // then ensure we send initial visible date after a tiny wait
+      setTimeout(updateCurrentVisible, 120);
+    }, 40);
+  } else {
+    updateCurrentVisible();
+  }
+
+})();
+</script>
+</body>
+</html>
